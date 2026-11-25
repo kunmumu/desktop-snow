@@ -61,6 +61,12 @@ static class Native
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+    [DllImport("user32.dll")] public static extern bool GetPhysicalCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
+    [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hmon, ref MONITORINFO mi);
+    [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmon, int type, out uint x, out uint y);
+    [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; }
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] public static extern IntPtr SetCapture(IntPtr h);
@@ -142,7 +148,111 @@ class Plow
     public bool Dumped;
 }
 
-class SnowOverlay : NativeWindow
+// 모니터 하나를 덮는 투명 창.
+// 배율이 큰 모니터(예: 200%)에서는 DPI-unaware 창으로 만들어 낮은 해상도로 그리고 Windows(DWM)가 확대하게 함
+// → 그리고 넘기는 픽셀 수가 크게 줄어듦
+class Surface : NativeWindow
+{
+    public Rectangle Phys, Log;
+    public float Sx = 1f, Scale = 1f;
+    public bool Scaled;
+    public IntPtr memDC, hBmp, oldBmp, bits;
+    public Bitmap Canvas;
+    public Graphics G;
+    public readonly List<Rectangle> Dirty = new List<Rectangle>();
+    readonly SnowOverlay owner;
+    public static bool NoScale;   // 테스트용: 확대 없이 물리 해상도로
+
+    public Surface(SnowOverlay owner, Rectangle phys, float scale)
+    {
+        this.owner = owner; Phys = phys; Scale = scale; Log = phys;
+        IntPtr old = IntPtr.Zero;
+        Scaled = scale > 1.01f && !NoScale;
+        if (Scaled)
+        {
+            try
+            {
+                var c = new Native.POINT(phys.Left + phys.Width / 2, phys.Top + phys.Height / 2);
+                IntPtr hmon = Native.MonitorFromPoint(c, 2);
+                old = Native.SetThreadDpiAwarenessContext(new IntPtr(-1)); // UNAWARE
+                var mi = new Native.MONITORINFO();
+                mi.cbSize = Marshal.SizeOf(typeof(Native.MONITORINFO));
+                if (Native.GetMonitorInfo(hmon, ref mi))
+                    Log = Rectangle.FromLTRB(mi.rcMonitor.Left, mi.rcMonitor.Top, mi.rcMonitor.Right, mi.rcMonitor.Bottom);
+                if (Log.Width >= phys.Width) Scaled = false;   // 가상화가 안 되면 일반 창
+            }
+            catch { Scaled = false; }
+            if (!Scaled)
+            {
+                if (old != IntPtr.Zero) { Native.SetThreadDpiAwarenessContext(old); old = IntPtr.Zero; }
+                Log = phys;
+            }
+        }
+        var cp = new CreateParams();
+        cp.Caption = "DesktopSnow";
+        cp.Style = Native.WS_POPUP;
+        cp.ExStyle = Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT | Native.WS_EX_TOOLWINDOW |
+                     Native.WS_EX_TOPMOST | Native.WS_EX_NOACTIVATE;
+        cp.X = Log.X; cp.Y = Log.Y; cp.Width = Log.Width; cp.Height = Log.Height;
+        CreateHandle(cp);
+        if (old != IntPtr.Zero) Native.SetThreadDpiAwarenessContext(old);
+        Sx = (float)Log.Width / phys.Width;
+        InitBuffer();
+    }
+
+    void InitBuffer()
+    {
+        var bmi = new Native.BITMAPINFOHEADER();
+        bmi.biSize = (uint)Marshal.SizeOf(typeof(Native.BITMAPINFOHEADER));
+        bmi.biWidth = Log.Width; bmi.biHeight = -Log.Height; bmi.biPlanes = 1; bmi.biBitCount = 32;
+        IntPtr screen = Native.GetDC(IntPtr.Zero);
+        hBmp = Native.CreateDIBSection(screen, ref bmi, 0, out bits, IntPtr.Zero, 0);
+        memDC = Native.CreateCompatibleDC(screen);
+        oldBmp = Native.SelectObject(memDC, hBmp);
+        Native.ReleaseDC(IntPtr.Zero, screen);
+        Canvas = new Bitmap(Log.Width, Log.Height, Log.Width * 4, PixelFormat.Format32bppPArgb, bits);
+        G = Graphics.FromImage(Canvas);
+        G.SmoothingMode = SmoothingMode.AntiAlias;
+        G.ScaleTransform(Sx, Sx);   // 그리기 좌표 = 이 모니터 기준 물리 픽셀
+    }
+
+    public void Present()
+    {
+        G.Flush(FlushIntention.Sync);
+        IntPtr old = IntPtr.Zero;
+        if (Scaled) old = Native.SetThreadDpiAwarenessContext(new IntPtr(-1));
+        var dst = new Native.POINT(Log.Left, Log.Top);
+        var size = new Native.SIZE(Log.Width, Log.Height);
+        var src = new Native.POINT(0, 0);
+        var blend = new Native.BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = 1 };
+        Native.UpdateLayeredWindow(Handle, IntPtr.Zero, ref dst, ref size, memDC, ref src, 0, ref blend, 2);
+        if (Scaled) Native.SetThreadDpiAwarenessContext(old);
+    }
+
+    public void SetClickThrough(bool on)
+    {
+        int ex = Native.GetWindowLong(Handle, Native.GWL_EXSTYLE);
+        ex = on ? (ex | Native.WS_EX_TRANSPARENT) : (ex & ~Native.WS_EX_TRANSPARENT);
+        Native.SetWindowLong(Handle, Native.GWL_EXSTYLE, ex);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (owner.SurfaceProc(this, ref m)) return;
+        base.WndProc(ref m);
+    }
+
+    public void Destroy()
+    {
+        if (G != null) { G.Dispose(); G = null; }
+        if (Canvas != null) { Canvas.Dispose(); Canvas = null; }
+        if (memDC != IntPtr.Zero) { Native.SelectObject(memDC, oldBmp); Native.DeleteDC(memDC); memDC = IntPtr.Zero; }
+        if (hBmp != IntPtr.Zero) { Native.DeleteObject(hBmp); hBmp = IntPtr.Zero; }
+        DestroyHandle();
+    }
+}
+
+class SnowOverlay
 {
     readonly Random rnd = new Random();
     readonly List<Flake> flakes = new List<Flake>();
@@ -163,13 +273,15 @@ class SnowOverlay : NativeWindow
     readonly SolidBrush pileShade = new SolidBrush(Color.FromArgb(70, 170, 190, 220));
     readonly Pen pileEdge = new Pen(Color.FromArgb(120, 150, 170, 200), 1.2f);
     readonly SolidBrush clearBrush = new SolidBrush(Color.Transparent);
-    readonly List<Rectangle> dirty = new List<Rectangle>();
+    List<Rectangle> dirty;   // 지금 그리는 모니터의 지울 영역
     readonly List<KeyValuePair<long, PointF>> hist = new List<KeyValuePair<long, PointF>>();
 
     Rectangle vs;
-    IntPtr memDC, hBmp, oldBmp, bits;
-    Bitmap canvas;
-    Graphics g;
+    readonly List<Surface> surfaces = new List<Surface>();
+    readonly HashSet<IntPtr> ownHandles = new HashSet<IntPtr>();
+    Graphics g;              // 지금 그리는 모니터의 Graphics
+    float curSx = 1f;
+    bool displayDirty;
     IntPtr mittenCursor;
     float S = 1f;   // DPI 배율
 
@@ -197,21 +309,12 @@ class SnowOverlay : NativeWindow
         enumProc = (h, l) => { enumResult.Add(h); return true; };
         for (int i = 0; i < 256; i++) flakeBrushes[i] = new SolidBrush(Color.FromArgb(i, 255, 255, 255));
 
-        vs = SystemInformation.VirtualScreen;
-        var cp = new CreateParams();
-        cp.Caption = "DesktopSnow";
-        cp.Style = Native.WS_POPUP;
-        cp.ExStyle = Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT | Native.WS_EX_TOOLWINDOW |
-                     Native.WS_EX_TOPMOST | Native.WS_EX_NOACTIVATE;
-        cp.X = vs.X; cp.Y = vs.Y; cp.Width = vs.Width; cp.Height = vs.Height;
-        CreateHandle(cp);
-
-        UpdateScale();
-        mittenCursor = MakeMittenCursor(S);
-        InitBuffer();
+        BuildSurfaces();
+        float maxScale = 1f;
+        foreach (var sf in surfaces) maxScale = Math.Max(maxScale, sf.Scale);
+        mittenCursor = MakeMittenCursor(maxScale);
         BuildGrounds();
         for (int i = 0; i < TargetCount; i++) flakes.Add(NewFlake(true));
-        Native.ShowWindow(Handle, 4); // SW_SHOWNOACTIVATE
 
         timer.Interval = 30;
         timer.Tick += (s, e) => Tick();
@@ -224,36 +327,46 @@ class SnowOverlay : NativeWindow
         };
     }
 
-    void UpdateScale()
+    static float MonitorScale(Rectangle b)
     {
-        try { uint d = Native.GetDpiForWindow(Handle); S = d > 0 ? d / 96f : 1f; }
-        catch { S = 1f; }
+        try
+        {
+            IntPtr hmon = Native.MonitorFromPoint(new Native.POINT(b.Left + b.Width / 2, b.Top + b.Height / 2), 2);
+            uint x, y;
+            if (Native.GetDpiForMonitor(hmon, 0, out x, out y) == 0 && x > 0) return x / 96f;
+        }
+        catch { }
+        return 1f;
     }
 
-    // ---------- 버퍼 ----------
-    void InitBuffer()
+    void BuildSurfaces()
     {
-        FreeBuffer();
-        var bmi = new Native.BITMAPINFOHEADER();
-        bmi.biSize = (uint)Marshal.SizeOf(typeof(Native.BITMAPINFOHEADER));
-        bmi.biWidth = vs.Width; bmi.biHeight = -vs.Height; bmi.biPlanes = 1; bmi.biBitCount = 32;
-        IntPtr screen = Native.GetDC(IntPtr.Zero);
-        hBmp = Native.CreateDIBSection(screen, ref bmi, 0, out bits, IntPtr.Zero, 0);
-        memDC = Native.CreateCompatibleDC(screen);
-        oldBmp = Native.SelectObject(memDC, hBmp);
-        Native.ReleaseDC(IntPtr.Zero, screen);
-        canvas = new Bitmap(vs.Width, vs.Height, vs.Width * 4, PixelFormat.Format32bppPArgb, bits);
-        g = Graphics.FromImage(canvas);
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        dirty.Clear();
+        foreach (var sf in surfaces) sf.Destroy();
+        surfaces.Clear();
+        ownHandles.Clear();
+        vs = SystemInformation.VirtualScreen;
+        float primary = 1f;
+        foreach (var scr in Screen.AllScreens)
+        {
+            float sc = MonitorScale(scr.Bounds);
+            if (scr.Primary) primary = sc;
+            var sf = new Surface(this, scr.Bounds, sc);
+            surfaces.Add(sf);
+            ownHandles.Add(sf.Handle);
+            if (!clickThrough) sf.SetClickThrough(false);
+            if (!paused) Native.ShowWindow(sf.Handle, 4); // SW_SHOWNOACTIVATE
+        }
+        S = primary;
     }
 
-    void FreeBuffer()
+    // 그 위치가 속한 모니터의 배율 (눈송이·눈덩이 크기용)
+    float ScaleAt(float x, float y)
     {
-        if (g != null) { g.Dispose(); g = null; }
-        if (canvas != null) { canvas.Dispose(); canvas = null; }
-        if (memDC != IntPtr.Zero) { Native.SelectObject(memDC, oldBmp); Native.DeleteDC(memDC); memDC = IntPtr.Zero; }
-        if (hBmp != IntPtr.Zero) { Native.DeleteObject(hBmp); hBmp = IntPtr.Zero; }
+        foreach (var sf in surfaces)
+            if (x >= sf.Phys.Left && x < sf.Phys.Right && y >= sf.Phys.Top && y < sf.Phys.Bottom) return sf.Scale;
+        foreach (var sf in surfaces)
+            if (x >= sf.Phys.Left && x < sf.Phys.Right) return sf.Scale;
+        return S;
     }
 
     void BuildGrounds()
@@ -262,67 +375,64 @@ class SnowOverlay : NativeWindow
         foreach (var s in Screen.AllScreens)
         {
             var wa = s.WorkingArea;
-            grounds.Add(new Ledge(new Rectangle(wa.Left, wa.Bottom, wa.Width, 0), true, 20f * S));
+            grounds.Add(new Ledge(new Rectangle(wa.Left, wa.Bottom, wa.Width, 0), true, 20f * MonitorScale(s.Bounds)));
         }
     }
 
-    protected override void WndProc(ref Message m)
+    public bool SurfaceProc(Surface sf, ref Message m)
     {
         switch (m.Msg)
         {
-            case 0x007E: // WM_DISPLAYCHANGE
-                vs = SystemInformation.VirtualScreen;
-                UpdateScale();
-                InitBuffer();
-                BuildGrounds();
-                plows.Clear();
-                break;
+            case 0x007E: // WM_DISPLAYCHANGE - 다음 프레임에 다시 구성
+                displayDirty = true;
+                return false;
             case 0x0021: // WM_MOUSEACTIVATE - 클릭해도 다른 창의 포커스를 뺏지 않음
                 m.Result = (IntPtr)3;
-                return;
+                return true;
             case 0x0020: // WM_SETCURSOR
                 Native.SetCursor(mittenCursor);
                 m.Result = (IntPtr)1;
-                return;
+                return true;
             case 0x0201: // WM_LBUTTONDOWN
                 OnMouseDown();
-                if (heldBall != null || heldMan != null) Native.SetCapture(Handle);
+                if (heldBall != null || heldMan != null) Native.SetCapture(sf.Handle);
                 m.Result = IntPtr.Zero;
-                return;
+                return true;
             case 0x0202: // WM_LBUTTONUP
                 OnMouseUp();
                 Native.ReleaseCapture();
                 m.Result = IntPtr.Zero;
-                return;
+                return true;
             case 0x0215: // WM_CAPTURECHANGED
                 OnMouseUp();
-                break;
+                return false;
         }
-        base.WndProc(ref m);
+        return false;
     }
 
     // ---------- 눈송이 ----------
     Flake NewFlake(bool anywhere)
     {
         var f = new Flake();
+        f.X = vs.Left + (float)(rnd.NextDouble() * (vs.Width + 200) - 100);
+        f.Y = anywhere ? vs.Top + (float)(rnd.NextDouble() * vs.Height) : vs.Top - (float)(rnd.NextDouble() * 40) - 5;
+        float k = ScaleAt(f.X, Math.Max(f.Y, vs.Top));
         f.Near = rnd.NextDouble() < 0.7;
         if (f.Near)
         {
-            f.R = (float)(1.6 + rnd.NextDouble() * 2.6) * S;
-            f.Fall = (float)(0.9 + f.R / S * 0.35 + rnd.NextDouble() * 0.4) * S;
+            f.R = (float)(1.6 + rnd.NextDouble() * 2.6) * k;
+            f.Fall = (float)(0.9 + f.R / k * 0.35 + rnd.NextDouble() * 0.4) * k;
             f.Alpha = 215 + rnd.Next(40);
         }
         else
         {
-            f.R = (float)(0.8 + rnd.NextDouble() * 0.9) * S;
-            f.Fall = (float)(0.45 + rnd.NextDouble() * 0.45) * S;
+            f.R = (float)(0.8 + rnd.NextDouble() * 0.9) * k;
+            f.Fall = (float)(0.45 + rnd.NextDouble() * 0.45) * k;
             f.Alpha = 110 + rnd.Next(60);
         }
-        f.X = vs.Left + (float)(rnd.NextDouble() * (vs.Width + 200) - 100);
-        f.Y = anywhere ? vs.Top + (float)(rnd.NextDouble() * vs.Height) : vs.Top - (float)(rnd.NextDouble() * 40) - 5;
         f.VY = f.Fall;
         f.Phase = (float)(rnd.NextDouble() * Math.PI * 2);
-        f.Sway = (float)(0.25 + rnd.NextDouble() * 0.55) * S;
+        f.Sway = (float)(0.25 + rnd.NextDouble() * 0.55) * k;
         return f;
     }
 
@@ -341,7 +451,7 @@ class SnowOverlay : NativeWindow
         var sb = new StringBuilder(64);
         foreach (var h in enumResult)
         {
-            if (h == Handle || !Native.IsWindowVisible(h) || Native.IsIconic(h)) continue;
+            if (ownHandles.Contains(h) || !Native.IsWindowVisible(h) || Native.IsIconic(h)) continue;
             int cloaked;
             if (Native.DwmGetWindowAttribute(h, 14, out cloaked, 4) == 0 && cloaked != 0) continue;
             int ex = Native.GetWindowLong(h, Native.GWL_EXSTYLE);
@@ -373,7 +483,7 @@ class SnowOverlay : NativeWindow
                 if (known) { ShakeOff(led); winLedges.Remove(h); }
                 continue;
             }
-            if (!known) { led = new Ledge(rect, false, 14f * S); winLedges[h] = led; }
+            if (!known) { led = new Ledge(rect, false, 14f * ScaleAt(rect.Left + rect.Width / 2f, rect.Top)); winLedges[h] = led; }
             else if (led.Rect != rect)
             {
                 ShakeOff(led);                    // 창을 움직이면 눈이 떨어짐
@@ -529,16 +639,15 @@ class SnowOverlay : NativeWindow
     PointF CursorPos()
     {
         Native.POINT p;
-        Native.GetCursorPos(out p);
+        try { if (!Native.GetPhysicalCursorPos(out p)) Native.GetCursorPos(out p); }
+        catch { Native.GetCursorPos(out p); }
         return new PointF(p.X, p.Y);
     }
 
     void SetClickThrough(bool on)
     {
         if (on == clickThrough) return;
-        int ex = Native.GetWindowLong(Handle, Native.GWL_EXSTYLE);
-        ex = on ? (ex | Native.WS_EX_TRANSPARENT) : (ex & ~Native.WS_EX_TRANSPARENT);
-        Native.SetWindowLong(Handle, Native.GWL_EXSTYLE, ex);
+        foreach (var sf in surfaces) sf.SetClickThrough(on);
         clickThrough = on;
     }
 
@@ -610,7 +719,7 @@ class SnowOverlay : NativeWindow
         if (L != null && balls.Count + men.Count < MaxObjects)
         {
             // 쌓인 눈을 한 움큼 퍼서 작은 눈덩이 만들기
-            float r0 = 7f * S;
+            float r0 = 7f * ScaleAt(p.X, p.Y);
             int idx = (int)p.X - L.Rect.Left, rad = (int)(r0 * 1.5f);
             for (int d = -rad; d <= rad; d++)
             {
@@ -850,10 +959,11 @@ class SnowOverlay : NativeWindow
     public void CallPlow()
     {
         if (plows.Count > 0) return;
-        float s = S * 1.1f;
         foreach (var L in grounds)
-            plows.Add(new Plow { L = L, Dir = 1, X = L.Rect.Left - 45 * s });
+            plows.Add(new Plow { L = L, Dir = 1, X = L.Rect.Left - 45 * PlowScale(L) });
     }
+
+    float PlowScale(Ledge L) { return ScaleAt(L.Rect.Left + L.Rect.Width / 2f, L.Rect.Top - 1) * 1.1f; }
 
     static float HeapH(Plow p, float s)
     {
@@ -862,11 +972,11 @@ class SnowOverlay : NativeWindow
 
     void StepPlows(float dt)
     {
-        float s = S * 1.1f;
         for (int i = plows.Count - 1; i >= 0; i--)
         {
             var p = plows[i];
             var L = p.L;
+            float s = PlowScale(L);
             float prevFront = p.X + p.Dir * 39 * s;
             p.X += p.Dir * 4.2f * S * dt;
             p.T += dt / 60f;
@@ -933,9 +1043,17 @@ class SnowOverlay : NativeWindow
         lastTick = now;
         frame++;
 
+        if (displayDirty)
+        {
+            displayDirty = false;
+            BuildSurfaces();
+            BuildGrounds();
+            plows.Clear();
+        }
         if (frame % 3 == 0) RefreshWindows();
         if (frame % 120 == 0)
-            Native.SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010); // 항상 위 유지
+            foreach (var sf in surfaces)
+                Native.SetWindowPos(sf.Handle, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010); // 항상 위 유지
 
         UpdateHeld();
         UpdateHover();
@@ -1019,22 +1137,36 @@ class SnowOverlay : NativeWindow
     }
 
     // ---------- 그리기 ----------
+    static bool Hits(Surface sf, float x, float y, float r)
+    {
+        return x + r >= sf.Phys.Left && x - r <= sf.Phys.Right && y + r >= sf.Phys.Top && y - r <= sf.Phys.Bottom;
+    }
+
     void Render()
     {
-        g.ResetClip();
-        int ox = -vs.Left, oy = -vs.Top;
+        foreach (var sf in surfaces) RenderSurface(sf);
+    }
 
-        // 전체를 지우지 않고 지난 프레임에 그린 부분만 지움 (고해상도에서 CPU 절약)
+    void RenderSurface(Surface sf)
+    {
+        g = sf.G; dirty = sf.Dirty; curSx = sf.Sx;
+        g.ResetClip();
+        int ox = -sf.Phys.Left, oy = -sf.Phys.Top;
+
+        // 전체를 지우지 않고 지난 프레임에 그린 부분만 지움
         g.SmoothingMode = SmoothingMode.None;
         g.CompositingMode = CompositingMode.SourceCopy;
-        foreach (var r in dirty) g.FillRectangle(clearBrush, r);
+        int pad = (int)Math.Ceiling(2 / sf.Sx);
+        foreach (var r in dirty) { var rr = r; rr.Inflate(pad, pad); g.FillRectangle(clearBrush, rr); }
         g.CompositingMode = CompositingMode.SourceOver;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         dirty.Clear();
 
-        foreach (var l in grounds) DrawPile(l, ox, oy);
+        foreach (var l in grounds)
+            if (Hits(sf, l.Rect.Left + l.Rect.Width / 2f, l.Rect.Top, l.Rect.Width / 2f + l.Max)) DrawPile(l, ox, oy);
         foreach (var l in active)
         {
+            if (!Hits(sf, l.Rect.Left + l.Rect.Width / 2f, l.Rect.Top, l.Rect.Width / 2f + l.Max)) continue;
             using (var rg = new Region(new Rectangle(l.Rect.Left + ox, l.Rect.Top - (int)l.Max - 2 + oy, l.Rect.Width, (int)l.Max + 3)))
             {
                 for (int k = 0; k < l.Z && k < occluders.Count; k++)
@@ -1047,28 +1179,23 @@ class SnowOverlay : NativeWindow
             }
         }
 
-        foreach (var p in plows) DrawPlow(p, ox, oy);
-        foreach (var b in balls) if (b.State != 2) DrawBall(b, ox, oy);
-        foreach (var m in men) DrawSnowman(m, ox, oy);
-        foreach (var b in balls) if (b.State == 2) DrawBall(b, ox, oy);
+        foreach (var p in plows) if (Hits(sf, p.X, p.L.Rect.Top, 200 * PlowScale(p.L))) DrawPlow(p, ox, oy);
+        foreach (var b in balls) if (b.State != 2 && Hits(sf, b.X, b.Y, b.R + 4)) DrawBall(b, ox, oy);
+        foreach (var m in men) if (Hits(sf, m.X, m.Bottom - m.RB * 2, m.RB * 3 + m.RH * 2)) DrawSnowman(m, ox, oy);
+        foreach (var b in balls) if (b.State == 2 && Hits(sf, b.X, b.Y, b.R + 4)) DrawBall(b, ox, oy);
 
         foreach (var f in flakes)
         {
+            if (!Hits(sf, f.X, f.Y, f.R + 2)) continue;
             float d = f.R * 2;
             float fx = f.X - f.R + ox, fy = f.Y - f.R + oy;
-            if (fx < -10 || fy < -10 || fx > vs.Width + 10 || fy > vs.Height + 10) continue;
             g.FillEllipse(flakeBrushes[f.Alpha], fx, fy, d, d);
             dirty.Add(new Rectangle((int)fx - 2, (int)fy - 2, (int)d + 5, (int)d + 5));
         }
 
-        foreach (var sp in sparkles) DrawSparkle(sp, ox, oy);
+        foreach (var sp in sparkles) if (Hits(sf, sp.X, sp.Y, sp.Size + 2)) DrawSparkle(sp, ox, oy);
 
-        g.Flush(FlushIntention.Sync);
-        var dst = new Native.POINT(vs.Left, vs.Top);
-        var size = new Native.SIZE(vs.Width, vs.Height);
-        var src = new Native.POINT(0, 0);
-        var blend = new Native.BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = 1 };
-        Native.UpdateLayeredWindow(Handle, IntPtr.Zero, ref dst, ref size, memDC, ref src, 0, ref blend, 2);
+        sf.Present();
     }
 
     void DrawPile(Ledge l, int ox, int oy)
@@ -1081,39 +1208,33 @@ class SnowOverlay : NativeWindow
         float baseY = l.Rect.Top + oy + 1;
         float left = l.Rect.Left + ox;
         dirty.Add(new Rectangle((int)left - 2, (int)(baseY - max) - 3, n + 4, (int)max + 6));
-        var pts = new List<PointF>(n / 2 + 4);
-        pts.Add(new PointF(left, baseY));
-        for (int j = 0; j < n; j += 2) pts.Add(new PointF(left + j, baseY - h[j]));
-        pts.Add(new PointF(left + n - 1, baseY - h[n - 1]));
-        pts.Add(new PointF(left + n - 1, baseY));
-        var arr = pts.ToArray();
-        g.FillPolygon(pileBrush, arr);
-
-        // 아래쪽 살짝 푸른 그림자 + 윗면 윤곽선 (흰 창 위에서도 보이게)
-        using (var shade = new GraphicsPath())
+        // 눈이 있는 구간만 골라서, 그라데이션 한 번으로 채우고 윗면 윤곽선만 그림
+        int stepPx = Math.Max(3, (int)Math.Round(2.5f / curSx));
+        using (var grad = new LinearGradientBrush(new RectangleF(left, baseY - max - 1, Math.Max(1, n), max + 2),
+                                                  Color.FromArgb(252, 255, 255, 255), Color.FromArgb(252, 218, 230, 248), 90f))
         {
-            var sp = new List<PointF>();
-            sp.Add(new PointF(left, baseY));
-            for (int j = 0; j < n; j += 2) sp.Add(new PointF(left + j, baseY - h[j] * 0.35f));
-            sp.Add(new PointF(left + n - 1, baseY));
-            shade.AddPolygon(sp.ToArray());
-            g.FillPath(pileShade, shade);
-        }
-        int start = -1;
-        for (int k = 1; k < arr.Length - 1; k++)
-        {
-            bool on = baseY - arr[k].Y > 0.4f;
-            if (on && start < 0) start = k;
-            if ((!on || k == arr.Length - 2) && start >= 0)
+            var top = new List<PointF>(64);
+            int j0 = -1;
+            for (int j = 0; j <= n; j += stepPx)
             {
-                int end = on ? k : k - 1;
-                if (end - start >= 1)
+                int jj = Math.Min(j, n - 1);
+                bool on = j < n && h[jj] > 0.3f;
+                if (on)
                 {
-                    var seg = new PointF[end - start + 1];
-                    Array.Copy(arr, start, seg, 0, seg.Length);
-                    g.DrawLines(pileEdge, seg);
+                    if (j0 < 0) { j0 = jj; top.Clear(); }
+                    top.Add(new PointF(left + jj, baseY - h[jj]));
                 }
-                start = -1;
+                if ((!on || j + stepPx > n) && j0 >= 0)
+                {
+                    float xEnd = top[top.Count - 1].X;
+                    var poly = new PointF[top.Count + 2];
+                    poly[0] = new PointF(left + j0 - stepPx * 0.5f, baseY);
+                    top.CopyTo(poly, 1);
+                    poly[poly.Length - 1] = new PointF(xEnd + stepPx * 0.5f, baseY);
+                    g.FillPolygon(grad, poly);
+                    if (top.Count >= 2) g.DrawLines(pileEdge, top.ToArray());
+                    j0 = -1;
+                }
             }
         }
     }
@@ -1371,8 +1492,8 @@ class SnowOverlay : NativeWindow
 
     void DrawPlow(Plow p, int ox, int oy)
     {
-        float s = S * 1.1f;
         var L = p.L;
+        float s = PlowScale(L);
         float hh = HeapH(p, s), hw = 4 + hh * 1.6f;
         var st = g.Save();
         g.TranslateTransform(p.X + ox, L.Rect.Top + oy + 1);
@@ -1519,15 +1640,15 @@ class SnowOverlay : NativeWindow
     public void SetPaused(bool p)
     {
         paused = p;
-        if (p) { SetClickThrough(true); Native.ShowWindow(Handle, 0); }
-        else { lastTick = 0; Native.ShowWindow(Handle, 4); }
+        if (p) { SetClickThrough(true); foreach (var sf in surfaces) Native.ShowWindow(sf.Handle, 0); }
+        else { lastTick = 0; foreach (var sf in surfaces) Native.ShowWindow(sf.Handle, 4); }
     }
 
     public void Shutdown()
     {
         timer.Stop();
-        FreeBuffer();
-        DestroyHandle();
+        foreach (var sf in surfaces) sf.Destroy();
+        surfaces.Clear();
     }
 }
 
@@ -1968,6 +2089,7 @@ class App : ApplicationContext
 
     public App(bool demo, bool lowPower)
     {
+        Surface.NoScale = Environment.GetCommandLineArgs().Length > 1 && Array.IndexOf(Environment.GetCommandLineArgs(), "--noscale") >= 0;
         overlay = new SnowOverlay();
         overlay.LowPower = lowPower;
         if (demo) overlay.Demo();
