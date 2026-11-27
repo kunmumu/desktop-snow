@@ -638,9 +638,13 @@ class SnowOverlay
     // ---------- 마우스 ----------
     PointF CursorPos()
     {
+        // 확대(DPI-unaware) 창의 메시지를 처리하는 중에는 Windows가 좌표를 논리 좌표로 바꿔 주므로,
+        // 읽는 동안만 스레드를 Per-Monitor 모드로 바꿔서 항상 실제 픽셀 좌표를 얻음
         Native.POINT p;
-        try { if (!Native.GetPhysicalCursorPos(out p)) Native.GetCursorPos(out p); }
-        catch { Native.GetCursorPos(out p); }
+        IntPtr old = IntPtr.Zero;
+        try { old = Native.SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch { }
+        Native.GetCursorPos(out p);
+        if (old != IntPtr.Zero) Native.SetThreadDpiAwarenessContext(old);
         return new PointF(p.X, p.Y);
     }
 
